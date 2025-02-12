@@ -1,0 +1,32 @@
+# Dataset files
+preprocessed_dataset/*.npy
+*.npy
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# Checkpoints and logs
+checkpoints/
+runs/
+*.log
+*.pth
+
+# Temporary files
+*.swp
+.DS_Store 
