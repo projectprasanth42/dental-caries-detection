@@ -2,13 +2,16 @@ import os
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.amp import autocast, GradScaler
 import numpy as np
 from tqdm import tqdm
 from datetime import datetime
 import sys
 import logging
 import gc
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 # Add the project root directory to the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -34,6 +37,22 @@ def collate_fn(batch):
     """
     return tuple(zip(*batch))
 
+def get_dataloader_kwargs(config, is_train=True):
+    """Get DataLoader kwargs based on config and whether it's training"""
+    kwargs = {
+        'batch_size': config.batch_size,
+        'shuffle': is_train,
+        'num_workers': config.num_workers,
+        'collate_fn': collate_fn,
+        'pin_memory': True if torch.cuda.is_available() else False,
+    }
+    
+    # Only add persistent_workers if num_workers > 0
+    if config.num_workers > 0:
+        kwargs['persistent_workers'] = True
+        
+    return kwargs
+
 def train_model(config: ModelConfig):
     try:
         # Enable garbage collection
@@ -43,11 +62,14 @@ def train_model(config: ModelConfig):
         device = torch.device(config.device)
         logging.info(f"Using device: {device}")
         
-        # Set torch to use deterministic algorithms
+        # Enable cuDNN benchmarking and deterministic mode
+        torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        
+        # Initialize mixed precision training
+        scaler = GradScaler()
 
-        # Create datasets
+        # Create datasets with augmentation
         logging.info("Creating datasets...")
         train_dataset = DentalCariesDataset(
             config.train_data_path,
@@ -61,50 +83,57 @@ def train_model(config: ModelConfig):
             is_training=False
         )
 
-        # Create data loaders
+        # Create data loaders with GPU optimizations
         logging.info("Creating data loaders...")
         train_loader = DataLoader(
             train_dataset,
-            batch_size=config.batch_size,
-            shuffle=True,
-            num_workers=config.num_workers,
-            collate_fn=collate_fn,
-            pin_memory=False  # Set to False for CPU training
+            **get_dataloader_kwargs(config, is_train=True)
         )
         
         val_loader = DataLoader(
             val_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-            collate_fn=collate_fn,
-            pin_memory=False  # Set to False for CPU training
+            **get_dataloader_kwargs(config, is_train=False)
         )
 
-        # Initialize model
+        # Initialize model with GPU optimizations
         logging.info("Initializing model...")
         model = DentalCariesMaskRCNN(
             num_classes=config.num_classes,
             hidden_dim=config.hidden_dim
         ).to(device)
 
-        # Initialize optimizer
+        # Enable sync BatchNorm for better batch statistics
+        if torch.cuda.device_count() > 1:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+        # Initialize optimizer with weight decay
+        param_groups = [
+            {'params': [], 'weight_decay': 0.0},  # no weight decay
+            {'params': [], 'weight_decay': config.weight_decay}  # with weight decay
+        ]
+        
+        for name, param in model.named_parameters():
+            if any(nd in name for nd in ['bias', 'LayerNorm', 'BatchNorm']):
+                param_groups[0]['params'].append(param)
+            else:
+                param_groups[1]['params'].append(param)
+
         optimizer = AdamW(
-            model.parameters(),
+            param_groups,
             lr=config.learning_rate,
-            weight_decay=config.weight_decay
+            betas=(config.beta1, config.beta2),
+            eps=config.eps
         )
 
-        # Initialize learning rate scheduler
-        scheduler = ReduceLROnPlateau(
+        # Cosine learning rate scheduler with warm restarts
+        scheduler = CosineAnnealingWarmRestarts(
             optimizer,
-            mode='min',
-            factor=0.1,
-            patience=5,
-            verbose=True
+            T_0=config.num_epochs // 3,  # Restart every 1/3 of total epochs
+            T_mult=2,  # Double the restart interval after each restart
+            eta_min=config.min_lr
         )
 
-        # Training loop
+        # Training loop with improvements
         best_val_loss = float('inf')
         patience_counter = 0
         
@@ -120,40 +149,56 @@ def train_model(config: ModelConfig):
             model.train()
             train_losses = []
             
-            # Create progress bar
             pbar = tqdm(train_loader, desc=f"Training Epoch {epoch+1}/{config.num_epochs}")
             
             for batch_idx, (images, targets) in enumerate(pbar):
                 try:
-                    # Clear memory
+                    # Clear memory periodically
                     if batch_idx % 5 == 0:
                         gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                     
                     # Move data to device
                     images = [image.to(device) for image in images]
                     targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                     
-                    # Training step
-                    loss, loss_dict = model.train_step(images, targets, optimizer)
+                    # Mixed precision training with updated syntax
+                    with autocast(device_type='cuda', dtype=torch.float16):
+                        loss, loss_dict = model.train_step(images, targets, optimizer)
+                    
+                    # Scale loss and backpropagate
+                    scaler.scale(loss).backward()
+                    
+                    # Gradient clipping
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_val)
+                    
+                    # Update weights
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+                    
                     train_losses.append(loss)
                     
                     # Update progress bar
                     pbar.set_postfix({
                         'loss': f'{loss:.4f}',
-                        'avg_loss': f'{np.mean(train_losses):.4f}'
+                        'avg_loss': f'{np.mean(train_losses):.4f}',
+                        'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
                     })
                     
                     # Log batch information
-                    if batch_idx % 5 == 0:  # Reduced logging frequency
+                    if batch_idx % 5 == 0:
                         logging.info(
                             f"Epoch {epoch+1}, Batch {batch_idx}/{len(train_loader)} - "
-                            f"Loss: {loss:.4f}, Avg Loss: {np.mean(train_losses):.4f}"
+                            f"Loss: {loss:.4f}, Avg Loss: {np.mean(train_losses):.4f}, "
+                            f"LR: {optimizer.param_groups[0]['lr']:.2e}"
                         )
                     
-                    # Clear some memory
+                    # Clear memory
                     del images, targets, loss_dict
-                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                        
+                    
                 except Exception as e:
                     logging.error(f"Error in batch {batch_idx}: {str(e)}")
                     continue
@@ -166,23 +211,24 @@ def train_model(config: ModelConfig):
             val_losses = []
             val_loss_dict = {}
             
-            # Create validation progress bar
             pbar = tqdm(val_loader, desc=f"Validation Epoch {epoch+1}/{config.num_epochs}")
             
             with torch.no_grad():
                 for images, targets in pbar:
                     try:
-                        # Clear some memory
+                        # Clear memory
                         gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                         
                         # Move data to device
                         images = [image.to(device) for image in images]
                         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                         
-                        # Use validation_step instead of train_step
-                        loss, batch_loss_dict = model.validation_step(images, targets)
+                        # Mixed precision inference with updated syntax
+                        with autocast(device_type='cuda', dtype=torch.float16):
+                            loss, batch_loss_dict = model.validation_step(images, targets)
                         
-                        # Only append valid loss values
                         if not torch.isnan(torch.tensor(loss)):
                             val_losses.append(loss)
                             
@@ -192,7 +238,6 @@ def train_model(config: ModelConfig):
                                     val_loss_dict[k] = []
                                 val_loss_dict[k].append(v.item())
                         
-                        # Update progress bar with current loss
                         current_avg = np.mean(val_losses) if val_losses else float('inf')
                         pbar.set_postfix({
                             'val_loss': f'{loss:.4f}',
@@ -201,16 +246,15 @@ def train_model(config: ModelConfig):
                         
                         # Clear memory
                         del images, targets, batch_loss_dict
-                        torch.cuda.empty_cache() if torch.cuda.is_available() else None
                         
                     except Exception as e:
                         logging.error(f"Error in validation batch: {str(e)}")
                         continue
             
-            # Calculate average validation loss safely
+            # Calculate average validation loss
             avg_val_loss = np.mean(val_losses) if val_losses else float('inf')
             
-            # Log detailed validation metrics
+            # Log validation metrics
             logging.info(f"Average validation loss: {avg_val_loss:.4f}")
             if val_loss_dict:
                 logging.info("Validation loss components:")
@@ -218,11 +262,11 @@ def train_model(config: ModelConfig):
                     avg = np.mean(v)
                     logging.info(f"  {k}: {avg:.4f}")
             
-            # Learning rate scheduling - only if we have valid losses
+            # Learning rate scheduling
             if val_losses:
-                scheduler.step(avg_val_loss)
+                scheduler.step()
             
-            # Save best model - only if we have valid losses
+            # Save best model
             if val_losses and (avg_val_loss < best_val_loss):
                 best_val_loss = avg_val_loss
                 patience_counter = 0
@@ -231,6 +275,8 @@ def train_model(config: ModelConfig):
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
                     'val_loss': avg_val_loss,
                 }, checkpoint_path)
                 logging.info(f"Saved best model to {checkpoint_path}")
@@ -244,7 +290,8 @@ def train_model(config: ModelConfig):
             
             # Clear memory at the end of epoch
             gc.collect()
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     except Exception as e:
         logging.error(f"Training failed: {str(e)}")
@@ -253,6 +300,9 @@ def train_model(config: ModelConfig):
 if __name__ == "__main__":
     try:
         config = ModelConfig()
+        # Set number of workers based on CPU count
+        if config.num_workers == 0 and torch.cuda.is_available():
+            config.num_workers = min(4, os.cpu_count() or 1)
         train_model(config)
     except Exception as e:
         logging.error(f"Failed to start training: {str(e)}")
