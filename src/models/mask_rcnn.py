@@ -66,30 +66,27 @@ class DentalCariesMaskRCNN(nn.Module):
     
     def train_step(self, images, targets, optimizer):
         """Enhanced training step with gradient clipping and loss scaling"""
-        optimizer.zero_grad()
-        
-        # Forward pass with mixed precision
+        # Forward pass
         loss_dict = self.model(images, targets)
         
         # Apply loss weights and scaling
-        weighted_losses = {
-            name: loss * self._get_loss_weight(name) * self._get_loss_scale(loss)
-            for name, loss in loss_dict.items()
-        }
-        losses = sum(weighted_losses.values())
+        weighted_losses = {}
+        total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
         
-        # Backward pass with gradient clipping
-        losses.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-        optimizer.step()
+        for name, loss in loss_dict.items():
+            weight = self._get_loss_weight(name)
+            scale = self._get_loss_scale(loss)
+            weighted_loss = loss * weight * scale
+            weighted_losses[name] = weighted_loss
+            total_loss += weighted_loss
         
-        return losses.item(), loss_dict
+        return total_loss, weighted_losses
     
     def _get_loss_scale(self, loss):
         """Dynamic loss scaling based on loss magnitude"""
         with torch.no_grad():
             scale = torch.clamp(1.0 / (loss + 1e-8), 0.1, 10.0)
-        return scale.item()
+        return scale
     
     def _get_loss_weight(self, loss_name):
         """Enhanced loss weights with focus on hard examples"""
@@ -105,9 +102,13 @@ class DentalCariesMaskRCNN(nn.Module):
     def validation_step(self, images, targets):
         """Validation step with weighted loss components"""
         loss_dict = self.model(images, targets)
-        losses = sum(loss * self._get_loss_weight(name) 
-                    for name, loss in loss_dict.items())
-        return losses.item(), loss_dict
+        total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        
+        for name, loss in loss_dict.items():
+            weight = self._get_loss_weight(name)
+            total_loss += loss * weight
+        
+        return total_loss, loss_dict
     
     @torch.no_grad()
     def evaluate_step(self, images):

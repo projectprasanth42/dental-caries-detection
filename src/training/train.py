@@ -179,11 +179,11 @@ def train_model(config: ModelConfig):
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
                     
-                    train_losses.append(loss)
+                    train_losses.append(loss.item())  # Convert tensor to number for logging
                     
                     # Update progress bar
                     pbar.set_postfix({
-                        'loss': f'{loss:.4f}',
+                        'loss': f'{loss.item():.4f}',
                         'avg_loss': f'{np.mean(train_losses):.4f}',
                         'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
                     })
@@ -192,12 +192,12 @@ def train_model(config: ModelConfig):
                     if batch_idx % 5 == 0:
                         logging.info(
                             f"Epoch {epoch+1}, Batch {batch_idx}/{len(train_loader)} - "
-                            f"Loss: {loss:.4f}, Avg Loss: {np.mean(train_losses):.4f}, "
+                            f"Loss: {loss.item():.4f}, Avg Loss: {np.mean(train_losses):.4f}, "
                             f"LR: {optimizer.param_groups[0]['lr']:.2e}"
                         )
                     
                     # Clear memory
-                    del images, targets, loss_dict
+                    del images, targets, loss_dict, loss
                     
                 except Exception as e:
                     logging.error(f"Error in batch {batch_idx}: {str(e)}")
@@ -229,8 +229,8 @@ def train_model(config: ModelConfig):
                         with autocast(device_type='cuda', dtype=torch.float16):
                             loss, batch_loss_dict = model.validation_step(images, targets)
                         
-                        if not torch.isnan(torch.tensor(loss)):
-                            val_losses.append(loss)
+                        if not torch.isnan(loss):
+                            val_losses.append(loss.item())  # Convert tensor to number for logging
                             
                             # Accumulate individual losses
                             for k, v in batch_loss_dict.items():
@@ -240,12 +240,12 @@ def train_model(config: ModelConfig):
                         
                         current_avg = np.mean(val_losses) if val_losses else float('inf')
                         pbar.set_postfix({
-                            'val_loss': f'{loss:.4f}',
+                            'val_loss': f'{loss.item():.4f}',
                             'avg_val_loss': f'{current_avg:.4f}'
                         })
                         
                         # Clear memory
-                        del images, targets, batch_loss_dict
+                        del images, targets, batch_loss_dict, loss
                         
                     except Exception as e:
                         logging.error(f"Error in validation batch: {str(e)}")
