@@ -23,15 +23,24 @@ class DentalCariesDataset(Dataset):
         print(f"Loaded images shape: {self.images.shape}")
         print(f"Loaded labels shape: {self.labels.shape}")
         
-        if transform is None:
-            self.transform = self.get_default_transforms(is_training)
-        else:
-            self.transform = transform
+        # Create transforms
+        self.transform = A.Compose([
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ])
+        
+        if is_training:
+            self.transform = A.Compose([
+                A.RandomRotate90(p=0.5),
+                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ToTensorV2()
+            ])
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
+        # Load image and label
         image = self.images[idx].astype(np.float32)
         label = self.labels[idx].astype(np.float32)
         
@@ -43,43 +52,23 @@ class DentalCariesDataset(Dataset):
         if image.max() > 1.0:
             image = image / 255.0
         
-        # Get boxes before transformation
+        # Convert label to uint8 for mask
+        mask = (label > 0).astype(np.uint8)
+        
+        # Apply transforms
+        transformed = self.transform(image=image, mask=mask)
+        image = transformed['image']
+        mask = transformed['mask']
+        
+        # Get boxes
         boxes = self._get_boxes(label)
         
-        # Prepare data for transformation
-        if len(boxes) == 0:
-            # If no valid boxes found, create a dummy target
-            transformed = self.transform(image=image, mask=label)
-            image = transformed['image']
-            label = transformed['mask']
-            target = {
-                'boxes': torch.zeros((0, 4), dtype=torch.float32),
-                'labels': torch.zeros((0,), dtype=torch.int64),
-                'masks': torch.zeros((0, label.shape[0], label.shape[1]), dtype=torch.uint8)
-            }
-        else:
-            # Convert boxes to list for albumentations
-            boxes_list = boxes.tolist()
-            labels_list = [1] * len(boxes)  # Assuming all boxes are caries
-            
-            # Apply transformations with bounding boxes
-            transformed = self.transform(
-                image=image,
-                mask=label,
-                bboxes=boxes_list,
-                class_labels=labels_list
-            )
-            
-            image = transformed['image']
-            label = transformed['mask']
-            transformed_boxes = torch.tensor(transformed['bboxes'], dtype=torch.float32)
-            transformed_labels = torch.tensor(transformed['class_labels'], dtype=torch.int64)
-            
-            target = {
-                'boxes': transformed_boxes,
-                'labels': transformed_labels,
-                'masks': label.unsqueeze(0)
-            }
+        # Create target dictionary
+        target = {
+            'boxes': boxes,
+            'labels': torch.ones(boxes.shape[0], dtype=torch.int64),
+            'masks': torch.as_tensor(mask[None], dtype=torch.uint8)
+        }
         
         return image, target
 
@@ -123,115 +112,4 @@ class DentalCariesDataset(Dataset):
         if not boxes:
             return torch.zeros((0, 4), dtype=torch.float32)
             
-        boxes = torch.tensor(boxes, dtype=torch.float32)
-        return boxes
-
-    @staticmethod
-    def get_default_transforms(is_training):
-        """Enhanced augmentation pipeline with dental-specific transforms"""
-        if is_training:
-            return A.Compose([
-                # Geometric Transforms with dental considerations
-                A.RandomRotate90(p=0.5),
-                A.Flip(p=0.5),
-                A.ShiftScaleRotate(
-                    shift_limit=0.0625,
-                    scale_limit=0.2,
-                    rotate_limit=45,
-                    border_mode=cv2.BORDER_CONSTANT,
-                    p=0.7
-                ),
-                
-                # Dental-specific spatial transforms
-                A.OneOf([
-                    A.ElasticTransform(
-                        alpha=120,
-                        sigma=120 * 0.05,
-                        border_mode=cv2.BORDER_CONSTANT,
-                        p=1.0
-                    ),
-                    A.GridDistortion(
-                        num_steps=5,
-                        distort_limit=0.3,
-                        border_mode=cv2.BORDER_CONSTANT,
-                        p=1.0
-                    ),
-                    A.OpticalDistortion(
-                        distort_limit=0.5,
-                        shift_limit=0.5,
-                        border_mode=cv2.BORDER_CONSTANT,
-                        p=1.0
-                    ),
-                ], p=0.5),
-                
-                # Enhanced noise simulation
-                A.OneOf([
-                    A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
-                    A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=1.0),
-                    A.MultiplicativeNoise(multiplier=(0.9, 1.1), p=1.0),
-                ], p=0.4),
-                
-                # Dental X-ray specific enhancements
-                A.OneOf([
-                    A.RandomBrightnessContrast(
-                        brightness_limit=0.2,
-                        contrast_limit=0.2,
-                        p=1.0
-                    ),
-                    A.RandomGamma(
-                        gamma_limit=(80, 120),
-                        p=1.0
-                    ),
-                    A.CLAHE(
-                        clip_limit=4.0,
-                        tile_grid_size=(8, 8),
-                        p=1.0
-                    ),
-                ], p=0.5),
-                
-                # Dental-specific detail enhancement
-                A.OneOf([
-                    A.Sharpen(alpha=(0.2, 0.5), lightness=(0.5, 1.0), p=1.0),
-                    A.UnsharpMask(p=1.0),
-                    A.MotionBlur(blur_limit=3, p=1.0),
-                ], p=0.3),
-                
-                # Advanced color adjustments
-                A.OneOf([
-                    A.HueSaturationValue(
-                        hue_shift_limit=20,
-                        sat_shift_limit=30,
-                        val_shift_limit=20,
-                        p=1.0
-                    ),
-                    A.RGBShift(
-                        r_shift_limit=20,
-                        g_shift_limit=20,
-                        b_shift_limit=20,
-                        p=1.0
-                    ),
-                ], p=0.3),
-                
-                # Cutout for robustness
-                A.CoarseDropout(
-                    max_holes=8,
-                    max_height=8,
-                    max_width=8,
-                    fill_value=0,
-                    p=0.2
-                ),
-                
-                # Final normalization
-                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ToTensorV2(),
-            ], bbox_params=A.BboxParams(
-                format='pascal_voc',
-                min_area=0,
-                min_visibility=0.3,
-                label_fields=['class_labels']  # Changed to match the transform input
-            ))
-        else:
-            return A.Compose([
-                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ToTensorV2(),
-            ]) 
+        return torch.tensor(boxes, dtype=torch.float32) 

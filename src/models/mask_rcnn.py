@@ -5,35 +5,6 @@ from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 import torch.nn.functional as F
 
-class AttentionModule(nn.Module):
-    def __init__(self, in_channels):
-        super(AttentionModule, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, in_channels//8, kernel_size=1)
-        self.conv2 = nn.Conv2d(in_channels//8, in_channels, kernel_size=1)
-        
-    def forward(self, x):
-        attention = F.avg_pool2d(x, x.size()[2:])
-        attention = F.relu(self.conv1(attention))
-        attention = torch.sigmoid(self.conv2(attention))
-        return x * attention
-
-class EnhancedMaskRCNNPredictor(nn.Module):
-    def __init__(self, in_channels, hidden_dim, num_classes):
-        super(EnhancedMaskRCNNPredictor, self).__init__()
-        self.attention = AttentionModule(in_channels)
-        self.conv5_mask = nn.ConvTranspose2d(in_channels, hidden_dim, 2, 2, 0)
-        self.relu = nn.ReLU(inplace=True)
-        self.mask_fcn_logits = nn.Conv2d(hidden_dim, num_classes, 1, 1, 0)
-        self.dropout = nn.Dropout(0.3)
-        
-    def forward(self, x):
-        x = self.attention(x)
-        x = self.conv5_mask(x)
-        x = self.relu(x)
-        x = self.dropout(x)
-        x = self.mask_fcn_logits(x)
-        return x
-
 class DentalCariesMaskRCNN(nn.Module):
     def __init__(self, num_classes, hidden_dim=512):
         super(DentalCariesMaskRCNN, self).__init__()
@@ -52,29 +23,13 @@ class DentalCariesMaskRCNN(nn.Module):
             rpn_positive_fraction=0.7,
         )
         
-        # Replace backbone with ResNet101
-        backbone = torchvision.models.resnet101(pretrained=True)
-        self.model.backbone.body = backbone
-        
         # Get number of input features
         in_features = self.model.roi_heads.box_predictor.cls_score.in_features
         in_features_mask = self.model.roi_heads.mask_predictor.conv5_mask.in_channels
         
-        # Enhanced predictors with attention and regularization
-        self.model.roi_heads.box_predictor = nn.Sequential(
-            AttentionModule(in_features),
-            nn.Dropout(0.3),
-            FastRCNNPredictor(in_features, num_classes)
-        )
-        
-        self.model.roi_heads.mask_predictor = EnhancedMaskRCNNPredictor(
-            in_features_mask, hidden_dim, num_classes
-        )
-        
-        # Add FPN attention modules
-        self.fpn_attention = nn.ModuleDict({
-            f'P{i}': AttentionModule(256) for i in range(2, 7)
-        })
+        # Replace the box predictor and mask predictor
+        self.model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+        self.model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, hidden_dim, num_classes)
         
         # Initialize weights
         self._initialize_weights()
@@ -103,11 +58,9 @@ class DentalCariesMaskRCNN(nn.Module):
             if torch.rand(1) < self.drop_path_prob:
                 return self.model(images, targets)
             
-        # Apply FPN attention
-        features = self.model.backbone(images)
-        for k, v in features.items():
-            if k in self.fpn_attention:
-                features[k] = self.fpn_attention[k](v)
+        # Convert list of images to a batch tensor if needed
+        if isinstance(images, list):
+            images = [img.to(next(self.parameters()).device) for img in images]
         
         return self.model(images, targets)
     

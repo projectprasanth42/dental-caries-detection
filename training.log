@@ -145,3 +145,20 @@ Epoch 1/300
 2025-02-12 18:06:14,953 - ERROR - Error in batch 1: 'Tensor' object has no attribute 'keys'
 2025-02-12 18:06:19,461 - ERROR - Error in batch 2: 'Tensor' object has no attribute 'keys'
 2025-02-12 18:06:23,790 - ERROR - Error in batch 3: 'Tensor' object has no attribute 'keys'
+2025-02-12 19:35:48,222 - INFO - Using device: cpu
+2025-02-12 19:35:48,229 - INFO - Creating datasets...
+2025-02-12 19:35:48,594 - INFO - Creating data loaders...
+2025-02-12 19:35:48,594 - INFO - Initializing model...
+2025-02-12 19:35:49,571 - INFO - Model checkpoints will be saved to checkpoints\20250212_193549
+2025-02-12 19:35:49,571 - INFO - 
+Epoch 1/100
+2025-02-12 19:35:49,628 - ERROR - Training failed: too many values to unpack (expected 2)
+2025-02-12 19:35:49,630 - ERROR - Failed to start training: too many values to unpack (expected 2)
+2025-02-12 19:36:19,958 - INFO - Using device: cpu
+2025-02-12 19:36:19,958 - INFO - Creating datasets...
+2025-02-12 19:36:20,270 - INFO - Creating data loaders...
+2025-02-12 19:36:20,270 - INFO - Initializing model...
+2025-02-12 19:36:21,234 - INFO - Model checkpoints will be saved to checkpoints\20250212_193621
+2025-02-12 19:36:21,234 - INFO - 
+Epoch 1/100
+2025-02-12 19:36:29,727 - INFO - Epoch 1, Batch 0/197 - Loss: -451424994729517257817325568.0000, Avg Loss: -451424994729517257817325568.0000
