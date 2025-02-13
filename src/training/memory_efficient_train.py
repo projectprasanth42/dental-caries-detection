@@ -20,32 +20,46 @@ def collate_fn(batch):
 def train_with_gradient_accumulation(model, images, targets, optimizer, scaler, config):
     """Training step with gradient accumulation"""
     # Split batch into smaller chunks
-    chunk_size = len(images) // config.gradient_accumulation_steps
+    chunk_size = max(1, len(images) // config.gradient_accumulation_steps)
     accumulated_loss = 0
     
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
     
     for i in range(config.gradient_accumulation_steps):
         start_idx = i * chunk_size
-        end_idx = start_idx + chunk_size
+        end_idx = min(start_idx + chunk_size, len(images))
+        
+        if start_idx >= len(images):
+            break
         
         chunk_images = images[start_idx:end_idx]
         chunk_targets = targets[start_idx:end_idx]
         
-        with torch.cuda.amp.autocast():
-            loss, loss_dict = model.train_step(chunk_images, chunk_targets, optimizer)
-            loss = loss / config.gradient_accumulation_steps
-        
-        scaler.scale(loss).backward()
-        accumulated_loss += loss.item() * config.gradient_accumulation_steps
-        
-        # Clear memory
-        del chunk_images, chunk_targets, loss, loss_dict
-        torch.cuda.empty_cache()
+        try:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                loss, loss_dict = model.train_step(chunk_images, chunk_targets, optimizer)
+                loss = loss / config.gradient_accumulation_steps
+            
+            scaler.scale(loss).backward()
+            accumulated_loss += loss.item() * config.gradient_accumulation_steps
+        except Exception as e:
+            print(f"Error in gradient accumulation step {i}: {str(e)}")
+            continue
+        finally:
+            # Clear memory
+            del chunk_images, chunk_targets, loss, loss_dict
+            torch.cuda.empty_cache()
     
-    scaler.step(optimizer)
-    scaler.update()
-    optimizer.zero_grad()
+    # Optimizer step
+    try:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_val)
+        scaler.step(optimizer)
+        scaler.update()
+    except Exception as e:
+        print(f"Error in optimizer step: {str(e)}")
+    finally:
+        optimizer.zero_grad(set_to_none=True)
     
     return accumulated_loss
 
@@ -61,10 +75,16 @@ def memory_efficient_training(config):
             hidden_dim=config.hidden_dim
         ).to(device)
         
+        # Enable cudnn benchmarking for faster training
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+        
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
-            weight_decay=config.weight_decay
+            weight_decay=config.weight_decay,
+            eps=1e-8
         )
         
         scaler = torch.cuda.amp.GradScaler()
@@ -82,7 +102,8 @@ def memory_efficient_training(config):
             shuffle=True,
             num_workers=config.num_workers,
             pin_memory=True,
-            collate_fn=collate_fn
+            collate_fn=collate_fn,
+            drop_last=True  # Prevent issues with small last batch
         )
         
         # Training loop
@@ -100,20 +121,22 @@ def memory_efficient_training(config):
                         torch.cuda.empty_cache()
                     
                     # Move data to GPU
-                    images = [image.to(device) for image in images]
-                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                    images = [image.to(device, non_blocking=True) for image in images]
+                    targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
                     
                     # Training step with gradient accumulation
                     loss = train_with_gradient_accumulation(
                         model, images, targets, optimizer, scaler, config
                     )
                     
-                    epoch_losses.append(loss)
+                    if not torch.isnan(torch.tensor(loss)):
+                        epoch_losses.append(loss)
                     
                     # Update progress bar
+                    avg_loss = np.mean(epoch_losses) if epoch_losses else float('inf')
                     pbar.set_postfix({
                         'loss': f'{loss:.4f}',
-                        'avg_loss': f'{np.mean(epoch_losses):.4f}'
+                        'avg_loss': f'{avg_loss:.4f}'
                     })
                     
                     # Clear memory
@@ -124,15 +147,26 @@ def memory_efficient_training(config):
                     print(f"Error in batch {batch_idx}: {str(e)}")
                     continue
             
-            print(f"Epoch {epoch+1} average loss: {np.mean(epoch_losses):.4f}")
+            avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else float('inf')
+            print(f"Epoch {epoch+1} average loss: {avg_epoch_loss:.4f}")
             
             # Save checkpoint
             if (epoch + 1) % 5 == 0:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }, f'checkpoint_epoch_{epoch+1}.pth')
+                try:
+                    checkpoint_path = f'checkpoint_epoch_{epoch+1}.pth'
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'loss': avg_epoch_loss,
+                    }, checkpoint_path)
+                    print(f"Saved checkpoint to {checkpoint_path}")
+                except Exception as e:
+                    print(f"Error saving checkpoint: {str(e)}")
+            
+            # Clear memory at end of epoch
+            gc.collect()
+            torch.cuda.empty_cache()
     
     except Exception as e:
         print(f"Training failed: {str(e)}")
