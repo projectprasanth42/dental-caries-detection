@@ -5,24 +5,25 @@ class ModelConfig:
     # Model Architecture
     backbone = "resnet101"
     num_classes = 3
-    hidden_dim = 512
+    hidden_dim = 256  # Reduced for memory efficiency
     nheads = 16
     num_encoder_layers = 8
     num_decoder_layers = 8
     
     # Advanced Model Settings
     fpn_channels = 256
-    roi_pool_size = 14
+    roi_pool_size = 7  # Reduced for memory efficiency
     attention_dropout = 0.3
     stochastic_depth_prob = 0.2
     
     # Training Parameters
-    batch_size = 8  # Increased for GPU memory
+    batch_size = 2  # Reduced for memory efficiency
+    gradient_accumulation_steps = 4  # Added for gradient accumulation
     learning_rate = 0.00005
     weight_decay = 0.0005
     num_epochs = 100
     early_stopping_patience = 15
-    num_workers = 4  # Increased for GPU training
+    num_workers = 2  # Reduced for memory efficiency
     
     # Optimizer Settings
     beta1 = 0.9
