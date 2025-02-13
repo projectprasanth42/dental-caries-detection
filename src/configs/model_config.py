@@ -17,12 +17,12 @@ class ModelConfig:
     stochastic_depth_prob = 0.2
     
     # Training Parameters
-    batch_size = 4  # Adjusted for GPU memory
+    batch_size = 8  # Increased for GPU memory
     learning_rate = 0.00005
     weight_decay = 0.0005
     num_epochs = 100
     early_stopping_patience = 15
-    num_workers = 2  # Default number of workers
+    num_workers = 4  # Increased for GPU training
     
     # Optimizer Settings
     beta1 = 0.9
@@ -68,11 +68,11 @@ class ModelConfig:
     focal_loss_gamma = 2.0
     
     # Paths
-    train_data_path = "preprocessed_dataset/X_train.npy"
-    train_labels_path = "preprocessed_dataset/y_train.npy"
-    val_data_path = "preprocessed_dataset/X_val.npy"
-    val_labels_path = "preprocessed_dataset/y_val.npy"
+    train_data_path = "../input/dental-caries-dataset/preprocessed_dataset/X_train.npy"  # Updated for Kaggle
+    train_labels_path = "../input/dental-caries-dataset/preprocessed_dataset/y_train.npy"  # Updated for Kaggle
+    val_data_path = "../input/dental-caries-dataset/preprocessed_dataset/X_val.npy"  # Updated for Kaggle
+    val_labels_path = "../input/dental-caries-dataset/preprocessed_dataset/y_val.npy"  # Updated for Kaggle
     
     # Device
-    device = "cpu"  # Using CPU instead of GPU
+    device = "cuda"  # Using GPU for training
     

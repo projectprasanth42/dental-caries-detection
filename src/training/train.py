@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.amp import autocast, GradScaler
 import numpy as np
 from tqdm import tqdm
 from datetime import datetime
@@ -46,7 +47,7 @@ def get_dataloader_kwargs(config, is_train=True):
         'shuffle': is_train,
         'num_workers': config.num_workers,
         'collate_fn': collate_fn,
-        'pin_memory': False,  # Changed to False for CPU
+        'pin_memory': True,  # Enable pin memory for GPU
     }
     
     # Only add persistent_workers if num_workers > 0
@@ -63,6 +64,14 @@ def train_model(config: ModelConfig):
         # Set device
         device = torch.device(config.device)
         logging.info(f"Using device: {device}")
+        
+        # Enable cuDNN benchmarking and deterministic mode
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = True
+        
+        # Initialize mixed precision training
+        scaler = GradScaler()
 
         # Create datasets with augmentation
         logging.info("Creating datasets...")
@@ -78,7 +87,7 @@ def train_model(config: ModelConfig):
             is_training=False
         )
 
-        # Create data loaders
+        # Create data loaders with GPU optimizations
         logging.info("Creating data loaders...")
         train_loader = DataLoader(
             train_dataset,
@@ -90,7 +99,7 @@ def train_model(config: ModelConfig):
             **get_dataloader_kwargs(config, is_train=False)
         )
 
-        # Initialize model
+        # Initialize model with GPU optimizations
         logging.info("Initializing model...")
         model = DentalCariesMaskRCNN(
             num_classes=config.num_classes,
@@ -147,23 +156,28 @@ def train_model(config: ModelConfig):
                     # Clear memory periodically
                     if batch_idx % 5 == 0:
                         gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                     
                     # Move data to device
                     images = [image.to(device) for image in images]
                     targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                     
-                    # Forward pass and compute loss
-                    loss, loss_dict = model.train_step(images, targets, optimizer)
+                    # Mixed precision training
+                    with autocast(device_type='cuda', dtype=torch.float16):
+                        loss, loss_dict = model.train_step(images, targets, optimizer)
                     
-                    # Backward pass
-                    loss.backward()
+                    # Scale loss and backpropagate
+                    scaler.scale(loss).backward()
                     
                     # Gradient clipping
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_val)
                     
-                    # Update weights
-                    optimizer.step()
-                    optimizer.zero_grad()
+                    # Update weights with gradient scaling
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
                     
                     train_losses.append(loss.item())
                     
@@ -204,13 +218,16 @@ def train_model(config: ModelConfig):
                     try:
                         # Clear memory
                         gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                         
                         # Move data to device
                         images = [image.to(device) for image in images]
                         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                         
-                        # Forward pass
-                        loss, batch_loss_dict = model.validation_step(images, targets)
+                        # Mixed precision inference
+                        with autocast(device_type='cuda', dtype=torch.float16):
+                            loss, batch_loss_dict = model.validation_step(images, targets)
                         
                         if not torch.isnan(loss):
                             val_losses.append(loss.item())
@@ -259,6 +276,7 @@ def train_model(config: ModelConfig):
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
                     'val_loss': avg_val_loss,
                 }, checkpoint_path)
                 logging.info(f"Saved best model to {checkpoint_path}")
@@ -272,6 +290,8 @@ def train_model(config: ModelConfig):
             
             # Clear memory at the end of epoch
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     except Exception as e:
         logging.error(f"Training failed: {str(e)}")
