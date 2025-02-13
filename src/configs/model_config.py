@@ -3,39 +3,39 @@ from dataclasses import dataclass
 @dataclass
 class ModelConfig:
     # Model Architecture
-    backbone = "resnet101"
+    backbone = "resnet34"  # Changed from resnet101 for memory efficiency
     num_classes = 3
-    hidden_dim = 256  # Reduced for memory efficiency
-    nheads = 16
-    num_encoder_layers = 8
-    num_decoder_layers = 8
+    hidden_dim = 128  # Further reduced from 256
+    nheads = 8  # Reduced from 16
+    num_encoder_layers = 4  # Reduced from 8
+    num_decoder_layers = 4  # Reduced from 8
     
     # Advanced Model Settings
-    fpn_channels = 256
-    roi_pool_size = 7  # Reduced for memory efficiency
-    attention_dropout = 0.3
-    stochastic_depth_prob = 0.2
+    fpn_channels = 128  # Reduced from 256
+    roi_pool_size = 5  # Reduced from 7
+    attention_dropout = 0.1  # Reduced from 0.3
+    stochastic_depth_prob = 0.1  # Reduced from 0.2
     
     # Training Parameters
-    batch_size = 2  # Reduced for memory efficiency
-    gradient_accumulation_steps = 4  # Added for gradient accumulation
-    learning_rate = 0.00005
-    weight_decay = 0.0005
+    batch_size = 1  # Reduced from 2
+    gradient_accumulation_steps = 8  # Increased from 4
+    learning_rate = 0.00001  # Reduced from 0.00005
+    weight_decay = 0.0001  # Reduced from 0.0005
     num_epochs = 100
-    early_stopping_patience = 15
-    num_workers = 2  # Reduced for memory efficiency
+    early_stopping_patience = 10  # Reduced from 15
+    num_workers = 0  # Changed from 2 to avoid memory issues
     
     # Optimizer Settings
     beta1 = 0.9
     beta2 = 0.999
     eps = 1e-8
-    gradient_clip_val = 1.0
+    gradient_clip_val = 0.5  # Reduced from 1.0
     
     # Learning Rate Schedule
-    warmup_epochs = 5
-    min_lr = 1e-6
-    lr_schedule_patience = 5
-    lr_reduce_factor = 0.5
+    warmup_epochs = 3  # Reduced from 5
+    min_lr = 1e-7  # Reduced from 1e-6
+    lr_schedule_patience = 3  # Reduced from 5
+    lr_reduce_factor = 0.1  # Changed from 0.5
     
     # Loss weights
     detection_loss_weight = 1.5
@@ -45,15 +45,15 @@ class ModelConfig:
     mask_loss_weight = 2.0
     
     # RPN Settings
-    rpn_fg_iou_thresh = 0.7  # Increased for better foreground detection
-    rpn_bg_iou_thresh = 0.3  # Decreased for better background separation
+    rpn_fg_iou_thresh = 0.7
+    rpn_bg_iou_thresh = 0.3
     rpn_positive_fraction = 0.7
     rpn_score_thresh = 0.05
     
     # ROI Settings
     box_score_thresh = 0.05
-    box_nms_thresh = 0.5  # Increased for better overlap handling
-    box_detections_per_img = 100  # Reduced for memory efficiency
+    box_nms_thresh = 0.5
+    box_detections_per_img = 50  # Reduced from 100
     
     # Data Augmentation
     augmentation_prob = 0.8
@@ -69,10 +69,10 @@ class ModelConfig:
     focal_loss_gamma = 2.0
     
     # Paths
-    train_data_path = "../input/dental-caries-dataset/preprocessed_dataset/X_train.npy"  # Updated for Kaggle
-    train_labels_path = "../input/dental-caries-dataset/preprocessed_dataset/y_train.npy"  # Updated for Kaggle
-    val_data_path = "../input/dental-caries-dataset/preprocessed_dataset/X_val.npy"  # Updated for Kaggle
-    val_labels_path = "../input/dental-caries-dataset/preprocessed_dataset/y_val.npy"  # Updated for Kaggle
+    train_data_path = "/kaggle/input/dental-caries-dataset/X_train.npy"  # Fixed path
+    train_labels_path = "/kaggle/input/dental-caries-dataset/y_train.npy"  # Fixed path
+    val_data_path = "/kaggle/input/dental-caries-dataset/X_val.npy"  # Fixed path
+    val_labels_path = "/kaggle/input/dental-caries-dataset/y_val.npy"  # Fixed path
     
     # Device
     device = "cuda"  # Using GPU for training

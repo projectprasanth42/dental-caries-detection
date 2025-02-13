@@ -3,6 +3,12 @@ import gc
 from tqdm import tqdm
 import numpy as np
 from torch.utils.data import DataLoader
+import os
+
+# Set CUDA environment variables
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['TORCH_USE_CUDA_DSA'] = '1'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 
 from src.models.mask_rcnn import DentalCariesMaskRCNN
 from src.data.dataset import DentalCariesDataset
@@ -10,86 +16,71 @@ from src.configs.model_config import ModelConfig
 
 def collate_fn(batch):
     """Custom collate function for the DataLoader"""
-    images = []
-    targets = []
-    for image, target in batch:
-        images.append(image)
-        targets.append(target)
-    return images, targets
+    return tuple(zip(*batch))
+
+def safe_to_device(tensor, device):
+    """Safely move tensor to device"""
+    try:
+        return tensor.to(device, non_blocking=True)
+    except Exception as e:
+        print(f"Error moving tensor to device: {str(e)}")
+        return tensor
 
 def train_with_gradient_accumulation(model, images, targets, optimizer, scaler, config):
-    """Training step with gradient accumulation"""
-    # Split batch into smaller chunks
-    chunk_size = max(1, len(images) // config.gradient_accumulation_steps)
+    """Training step with gradient accumulation and error handling"""
     accumulated_loss = 0
+    optimizer.zero_grad(set_to_none=True)
     
-    optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
-    
-    for i in range(config.gradient_accumulation_steps):
-        start_idx = i * chunk_size
-        end_idx = min(start_idx + chunk_size, len(images))
-        
-        if start_idx >= len(images):
-            break
-        
-        chunk_images = images[start_idx:end_idx]
-        chunk_targets = targets[start_idx:end_idx]
-        
-        try:
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                loss, loss_dict = model.train_step(chunk_images, chunk_targets, optimizer)
-                loss = loss / config.gradient_accumulation_steps
-            
-            scaler.scale(loss).backward()
-            accumulated_loss += loss.item() * config.gradient_accumulation_steps
-        except Exception as e:
-            print(f"Error in gradient accumulation step {i}: {str(e)}")
-            continue
-        finally:
-            # Clear memory
-            del chunk_images, chunk_targets, loss, loss_dict
-            torch.cuda.empty_cache()
-    
-    # Optimizer step
     try:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_val)
-        scaler.step(optimizer)
-        scaler.update()
+        # Forward pass with mixed precision
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+            loss = losses / config.gradient_accumulation_steps
+        
+        # Backward pass
+        scaler.scale(loss).backward()
+        accumulated_loss = loss.item() * config.gradient_accumulation_steps
+        
+        # Memory cleanup
+        del loss_dict, losses, loss
+        torch.cuda.empty_cache()
+        
+        return accumulated_loss
+        
     except Exception as e:
-        print(f"Error in optimizer step: {str(e)}")
-    finally:
-        optimizer.zero_grad(set_to_none=True)
-    
-    return accumulated_loss
+        print(f"Error in training step: {str(e)}")
+        return 0
 
 def memory_efficient_training(config):
     try:
-        # Enable garbage collection
-        gc.enable()
-        
-        # Initialize model, optimizer, etc.
-        device = torch.device(config.device)
+        # Initialize model on CPU first
+        print("Initializing model on CPU...")
         model = DentalCariesMaskRCNN(
             num_classes=config.num_classes,
             hidden_dim=config.hidden_dim
-        ).to(device)
+        )
         
-        # Enable cudnn benchmarking for faster training
+        # Move model to GPU carefully
         if torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.deterministic = False
+            device = torch.device('cuda')
+            print(f"Moving model to {device}...")
+            model = model.to(device)
+        else:
+            device = torch.device('cpu')
+            print("CUDA not available, using CPU")
         
+        # Initialize optimizer and scaler
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
-            eps=1e-8
+            eps=config.eps
         )
         
         scaler = torch.cuda.amp.GradScaler()
         
-        # Create datasets and dataloaders
+        # Create dataset and dataloader
         train_dataset = DentalCariesDataset(
             config.train_data_path,
             config.train_labels_path,
@@ -98,15 +89,14 @@ def memory_efficient_training(config):
         
         train_loader = DataLoader(
             train_dataset,
-            batch_size=config.batch_size * config.gradient_accumulation_steps,
+            batch_size=config.batch_size,
             shuffle=True,
             num_workers=config.num_workers,
-            pin_memory=True,
-            collate_fn=collate_fn,
-            drop_last=True  # Prevent issues with small last batch
+            pin_memory=False,
+            collate_fn=collate_fn
         )
         
-        # Training loop
+        print("Starting training...")
         for epoch in range(config.num_epochs):
             model.train()
             epoch_losses = []
@@ -115,21 +105,24 @@ def memory_efficient_training(config):
             
             for batch_idx, (images, targets) in enumerate(pbar):
                 try:
-                    # Clear memory
-                    if batch_idx % 2 == 0:
-                        gc.collect()
-                        torch.cuda.empty_cache()
+                    # Move data to device
+                    images = [safe_to_device(img, device) for img in images]
+                    targets = [{k: safe_to_device(v, device) for k, v in t.items()} for t in targets]
                     
-                    # Move data to GPU
-                    images = [image.to(device, non_blocking=True) for image in images]
-                    targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
-                    
-                    # Training step with gradient accumulation
+                    # Training step
                     loss = train_with_gradient_accumulation(
                         model, images, targets, optimizer, scaler, config
                     )
                     
-                    if not torch.isnan(torch.tensor(loss)):
+                    # Update optimizer
+                    if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_val)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
+                    
+                    if loss > 0:
                         epoch_losses.append(loss)
                     
                     # Update progress bar
@@ -139,14 +132,17 @@ def memory_efficient_training(config):
                         'avg_loss': f'{avg_loss:.4f}'
                     })
                     
-                    # Clear memory
+                    # Memory cleanup
                     del images, targets
-                    torch.cuda.empty_cache()
+                    if batch_idx % 2 == 0:
+                        torch.cuda.empty_cache()
+                        gc.collect()
                     
                 except Exception as e:
                     print(f"Error in batch {batch_idx}: {str(e)}")
                     continue
             
+            # End of epoch
             avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else float('inf')
             print(f"Epoch {epoch+1} average loss: {avg_epoch_loss:.4f}")
             
@@ -164,9 +160,9 @@ def memory_efficient_training(config):
                 except Exception as e:
                     print(f"Error saving checkpoint: {str(e)}")
             
-            # Clear memory at end of epoch
-            gc.collect()
+            # Memory cleanup
             torch.cuda.empty_cache()
+            gc.collect()
     
     except Exception as e:
         print(f"Training failed: {str(e)}")
