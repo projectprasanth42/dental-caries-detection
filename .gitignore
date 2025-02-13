@@ -1,32 +1,35 @@
-# Dataset files
-preprocessed_dataset/*.npy
-*.npy
-
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project specific
+checkpoints/
+*.log
+*.pth
+preprocessed_dataset/
+
+# OS specific
+.DS_Store
+Thumbs.db
 
 # Distribution / packaging
 dist/
 build/
-*.egg-info/
-
-# Virtual environment
-venv/
-env/
-ENV/
-
-# IDE
-.vscode/
-.idea/
-
-# Checkpoints and logs
-checkpoints/
-runs/
-*.log
-*.pth
-
-# Temporary files
-*.swp
-.DS_Store 
+*.egg-info/ 

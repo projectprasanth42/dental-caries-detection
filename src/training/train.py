@@ -3,15 +3,12 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.amp import autocast, GradScaler
 import numpy as np
 from tqdm import tqdm
 from datetime import datetime
 import sys
 import logging
 import gc
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
 
 # Add the project root directory to the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -33,9 +30,14 @@ logging.basicConfig(
 
 def collate_fn(batch):
     """
-    Custom collate function for the DataLoader
+    Custom collate function for the DataLoader that properly handles dictionary targets
     """
-    return tuple(zip(*batch))
+    images = []
+    targets = []
+    for image, target in batch:
+        images.append(image)
+        targets.append(target)
+    return images, targets
 
 def get_dataloader_kwargs(config, is_train=True):
     """Get DataLoader kwargs based on config and whether it's training"""
@@ -44,7 +46,7 @@ def get_dataloader_kwargs(config, is_train=True):
         'shuffle': is_train,
         'num_workers': config.num_workers,
         'collate_fn': collate_fn,
-        'pin_memory': True if torch.cuda.is_available() else False,
+        'pin_memory': False,  # Changed to False for CPU
     }
     
     # Only add persistent_workers if num_workers > 0
@@ -61,13 +63,6 @@ def train_model(config: ModelConfig):
         # Set device
         device = torch.device(config.device)
         logging.info(f"Using device: {device}")
-        
-        # Enable cuDNN benchmarking and deterministic mode
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = True
-        
-        # Initialize mixed precision training
-        scaler = GradScaler()
 
         # Create datasets with augmentation
         logging.info("Creating datasets...")
@@ -83,7 +78,7 @@ def train_model(config: ModelConfig):
             is_training=False
         )
 
-        # Create data loaders with GPU optimizations
+        # Create data loaders
         logging.info("Creating data loaders...")
         train_loader = DataLoader(
             train_dataset,
@@ -95,16 +90,12 @@ def train_model(config: ModelConfig):
             **get_dataloader_kwargs(config, is_train=False)
         )
 
-        # Initialize model with GPU optimizations
+        # Initialize model
         logging.info("Initializing model...")
         model = DentalCariesMaskRCNN(
             num_classes=config.num_classes,
             hidden_dim=config.hidden_dim
         ).to(device)
-
-        # Enable sync BatchNorm for better batch statistics
-        if torch.cuda.device_count() > 1:
-            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
         # Initialize optimizer with weight decay
         param_groups = [
@@ -156,30 +147,25 @@ def train_model(config: ModelConfig):
                     # Clear memory periodically
                     if batch_idx % 5 == 0:
                         gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
                     
                     # Move data to device
                     images = [image.to(device) for image in images]
                     targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                     
-                    # Mixed precision training with updated syntax
-                    with autocast(device_type='cuda', dtype=torch.float16):
-                        loss, loss_dict = model.train_step(images, targets, optimizer)
+                    # Forward pass and compute loss
+                    loss, loss_dict = model.train_step(images, targets, optimizer)
                     
-                    # Scale loss and backpropagate
-                    scaler.scale(loss).backward()
+                    # Backward pass
+                    loss.backward()
                     
                     # Gradient clipping
-                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_val)
                     
                     # Update weights
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+                    optimizer.step()
+                    optimizer.zero_grad()
                     
-                    train_losses.append(loss.item())  # Convert tensor to number for logging
+                    train_losses.append(loss.item())
                     
                     # Update progress bar
                     pbar.set_postfix({
@@ -218,19 +204,16 @@ def train_model(config: ModelConfig):
                     try:
                         # Clear memory
                         gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
                         
                         # Move data to device
                         images = [image.to(device) for image in images]
                         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                         
-                        # Mixed precision inference with updated syntax
-                        with autocast(device_type='cuda', dtype=torch.float16):
-                            loss, batch_loss_dict = model.validation_step(images, targets)
+                        # Forward pass
+                        loss, batch_loss_dict = model.validation_step(images, targets)
                         
                         if not torch.isnan(loss):
-                            val_losses.append(loss.item())  # Convert tensor to number for logging
+                            val_losses.append(loss.item())
                             
                             # Accumulate individual losses
                             for k, v in batch_loss_dict.items():
@@ -276,7 +259,6 @@ def train_model(config: ModelConfig):
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict(),
-                    'scaler_state_dict': scaler.state_dict(),
                     'val_loss': avg_val_loss,
                 }, checkpoint_path)
                 logging.info(f"Saved best model to {checkpoint_path}")
@@ -290,8 +272,6 @@ def train_model(config: ModelConfig):
             
             # Clear memory at the end of epoch
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     except Exception as e:
         logging.error(f"Training failed: {str(e)}")
@@ -301,7 +281,7 @@ if __name__ == "__main__":
     try:
         config = ModelConfig()
         # Set number of workers based on CPU count
-        if config.num_workers == 0 and torch.cuda.is_available():
+        if config.num_workers == 0:
             config.num_workers = min(4, os.cpu_count() or 1)
         train_model(config)
     except Exception as e:
